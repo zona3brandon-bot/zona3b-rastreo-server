@@ -6,7 +6,7 @@ import rateLimit from 'express-rate-limit';
 const PORT = Number(process.env.PORT || 10000);
 const API_BASE = 'https://api.17track.net/track/v2.4';
 const API_KEY = String(process.env.TRACK17_API_KEY || '').trim();
-const CARRIER_CODE = Number(process.env.TRACK17_CARRIER_CODE || 0) || undefined;
+const CARRIER_CODE = Number(process.env.TRACK17_CARRIER_CODE || 3211); // Correos de Cuba
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://zona3brandon.us,https://www.zona3brandon.us')
   .split(',').map(value => value.trim()).filter(Boolean);
 const DEBUG_TRACKING = process.env.DEBUG_TRACKING === '1';
@@ -66,7 +66,7 @@ async function post17Track(endpoint, body, timeoutMs = 35_000) {
       headers: {
         'content-type': 'application/json',
         '17token': API_KEY,
-        'user-agent': 'Zona3B-Tracking/10.0'
+        'user-agent': 'Zona3B-Tracking/10.1'
       },
       body: JSON.stringify(body),
       signal: controller.signal
@@ -231,62 +231,91 @@ function requestItem(code, year, includeCacheLevel = false) {
   return item;
 }
 
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function rejectionFromError(error) {
+  return error?.details?.response?.data?.rejected?.[0]?.error || null;
+}
+
+function isAlreadyRegistered(rejection) {
+  const code = Number(rejection?.code || 0);
+  const message = clean(rejection?.message || '').toLowerCase();
+  return code === -18019901 || message.includes('already registered') || message.includes('already exists');
+}
+
 async function getTracking(code, year) {
-  // Primero consulta datos ya registrados. Esta operación no inicia una nueva consulta al transportista.
-  const stored = await post17Track('gettrackinfo', [requestItem(code, year)]);
-  const storedItem = acceptedItem(stored);
-  const storedRejected = rejectedError(stored);
+  const queryItem = requestItem(code, year, true);
 
-  if (storedItem) {
-    const normalized = normalizeTrack(storedItem, code);
-    if (normalized.events.length > 0 && normalized.mainStatus !== 'NotFound') return normalized;
+  // Correos de Cuba debe consultarse con el código de transportista 3211.
+  // Intentamos primero una consulta en tiempo real para devolver datos de inmediato.
+  try {
+    const realtime = await post17Track('getRealTimeTrackInfo', [queryItem], 35_000);
+    const realtimeItem = acceptedItem(realtime);
+    if (realtimeItem) return normalizeTrack(realtimeItem, code);
+
+    const realtimeRejected = rejectedError(realtime);
+    if (realtimeRejected && ![-18019818, -18019909, -18019902].includes(realtimeRejected.code)) {
+      throw createApiError(realtimeRejected.message, 'TRACK17_REJECTED', realtimeRejected, 422);
+    }
+  } catch (error) {
+    // Algunos planes o transportistas no permiten consulta instantánea. En esos casos,
+    // registramos el número y consultamos el resultado almacenado.
+    const rejection = rejectionFromError(error);
+    const recoverableCodes = new Set([-18019818, -18019815, -18019816, -18019909, -18019902, -18019912]);
+    if (!recoverableCodes.has(Number(rejection?.code || 0)) && error?.technicalCode !== 'TRACK17_API_ERROR') {
+      throw error;
+    }
   }
 
-  // Si no existe o no tiene movimientos, realiza una consulta estándar en tiempo real.
-  const realtime = await post17Track('getRealTimeTrackInfo', [requestItem(code, year, true)], 40_000);
-  const realtimeItem = acceptedItem(realtime);
-  const realtimeRejected = rejectedError(realtime);
-
-  if (realtimeItem) return normalizeTrack(realtimeItem, code);
-
-  const rejection = realtimeRejected || storedRejected;
-  if (rejection) {
-    if (rejection.code === -18019903) {
-      throw createApiError(
-        '17TRACK no pudo identificar automáticamente el operador de este número.',
-        'CARRIER_NOT_DETECTED',
-        rejection,
-        422
-      );
+  // Registrar explícitamente con Correos de Cuba (carrier 3211).
+  try {
+    const registration = await post17Track('register', [requestItem(code, year)]);
+    const regRejected = rejectedError(registration);
+    if (regRejected && !isAlreadyRegistered(regRejected)) {
+      throw createApiError(regRejected.message, 'TRACK17_REGISTER_REJECTED', regRejected, 422);
     }
-    if (rejection.code === -18019908) {
-      throw createApiError('La cuota disponible de 17TRACK se agotó.', 'TRACK17_QUOTA_EXHAUSTED', rejection, 429);
-    }
-    if (rejection.code === -18019909) {
-      return {
-        ok: true,
-        trackingNumber: code,
-        status: 'Sin información',
-        stage: 'Pendiente de registro',
-        mainStatus: 'NotFound',
-        subStatus: '',
-        summary: '17TRACK todavía no muestra movimientos para este número.',
-        carrier: { code: rejection.carrier || null, name: 'Operador postal' },
-        estimatedDelivery: { from: null, to: null, source: null },
-        events: []
-      };
-    }
-    throw createApiError(rejection.message, 'TRACK17_REJECTED', rejection, 422);
+  } catch (error) {
+    const rejection = rejectionFromError(error);
+    if (!isAlreadyRegistered(rejection)) throw error;
   }
 
-  throw createApiError('17TRACK no devolvió información para este número.', 'TRACK17_EMPTY_RESPONSE');
+  // 17TRACK indica que el resultado puede tardar varios segundos después del registro.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (attempt > 0) await sleep(4000);
+    const stored = await post17Track('gettrackinfo', [requestItem(code, year)]);
+    const storedItem = acceptedItem(stored);
+    if (storedItem) {
+      const normalized = normalizeTrack(storedItem, code);
+      if (normalized.events.length > 0 || normalized.mainStatus !== 'NotFound') return normalized;
+    }
+
+    const rejection = rejectedError(stored);
+    if (rejection && ![-18019909, -18019902].includes(rejection.code)) {
+      throw createApiError(rejection.message, 'TRACK17_REJECTED', rejection, 422);
+    }
+  }
+
+  return {
+    ok: true,
+    trackingNumber: code,
+    status: 'Procesando rastreo',
+    stage: 'Información recibida',
+    mainStatus: 'InfoReceived',
+    subStatus: '',
+    summary: 'El número fue aceptado por 17TRACK. Los primeros movimientos pueden tardar unos minutos en aparecer.',
+    carrier: { code: CARRIER_CODE, name: 'Correos de Cuba' },
+    estimatedDelivery: { from: null, to: null, source: null },
+    events: []
+  };
 }
 
 app.get('/health', (_req, res) => {
   res.set('Cache-Control', 'no-store').json({
     ok: true,
     service: 'zona3b-rastreo',
-    version: '10.0.0',
+    version: '10.1.0',
     provider: '17TRACK',
     apiConfigured: Boolean(API_KEY)
   });
@@ -337,11 +366,12 @@ app.get('/api/track', async (req, res) => {
       ok: false,
       message: error?.message || 'No fue posible obtener el rastreo en este momento.',
       technicalCode: error?.technicalCode || 'TRACK17_UPSTREAM_ERROR',
+      upstream: error?.details?.response?.data?.rejected?.[0]?.error || error?.details?.response || null,
       ...(DEBUG_TRACKING ? { debug: error?.details || null } : {})
     });
   }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Zona 3B tracking server v10.0 listening on ${PORT}; 17TRACK configured=${Boolean(API_KEY)}`);
+  console.log(`Zona 3B tracking server v10.1 listening on ${PORT}; 17TRACK configured=${Boolean(API_KEY)}`);
 });
