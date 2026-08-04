@@ -1,18 +1,9 @@
-ACTUALIZACIÓN V10.0 — API OFICIAL 17TRACK
+ZONA 3B RASTREO SERVER V10.2
 
-1. Descomprime este ZIP.
-2. En GitHub abre el repositorio zona3b-rastreo-server.
-3. Pulsa Add file > Upload files.
-4. Sube TODO el contenido de esta carpeta y reemplaza los archivos existentes.
-5. Haz commit con: ACTUALIZACION V10 API 17TRACK
-6. Render desplegará automáticamente.
-7. En Render > Environment confirma que existe TRACK17_API_KEY con la clave completa.
-8. Prueba:
-   https://zona3b-rastreo-server.onrender.com/health
-   Debe mostrar version 10.0.0 y apiConfigured true.
-9. Prueba:
-   https://zona3b-rastreo-server.onrender.com/api/quota
-10. Prueba el rastreo:
-   https://zona3b-rastreo-server.onrender.com/api/track?codigo=CM872184101ZB&anio=2026
+1. Suba todos estos archivos al repositorio zona3b-rastreo-server reemplazando los anteriores.
+2. Commit sugerido: ACTUALIZACION V10.2 TRANSPORTISTA CORREOS DE CUBA
+3. Espere a que Render muestre Live.
+4. Abra /health y confirme version 10.2.0.
+5. Consulte el paquete. El servidor forzará carrier 3211 y eliminará registros duplicados con operadores equivocados.
 
-IMPORTANTE: no pongas la clave de 17TRACK en GitHub ni en config.js de la página.
+Nota: la limpieza se realiza automáticamente al consultar cada número.

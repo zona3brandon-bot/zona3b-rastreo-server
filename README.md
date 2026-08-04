@@ -1,4 +1,4 @@
-# Zona 3B Tracking Server v10.1
+# Zona 3B Tracking Server v10.2
 
 Backend Node.js para la API oficial de 17TRACK.
 
@@ -14,3 +14,10 @@ Backend Node.js para la API oficial de 17TRACK.
 `TRACK17_API_KEY`
 
 Opcional: `TRACK17_CARRIER_CODE=3211`
+
+
+## Corrección v10.2
+
+- Fuerza siempre Correos de Cuba (`carrier: 3211`, `auto_detection: false`).
+- Detecta y elimina inscripciones duplicadas del mismo número con transportistas incorrectos.
+- Conserva únicamente la inscripción oficial de Correos de Cuba.
