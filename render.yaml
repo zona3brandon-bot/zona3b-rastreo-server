@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: zona3b-rastreo
+    runtime: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://zona3brandon.us,https://www.zona3brandon.us
+      - key: TRACKING_URL
+        value: https://www.correos.cu/rastreador-de-envios/
