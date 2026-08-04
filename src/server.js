@@ -2,342 +2,346 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { chromium } from 'playwright';
 
 const PORT = Number(process.env.PORT || 10000);
-const TRACKING_URL = process.env.TRACKING_URL || 'https://www.correos.cu/rastreador-de-envios/';
+const API_BASE = 'https://api.17track.net/track/v2.4';
+const API_KEY = String(process.env.TRACK17_API_KEY || '').trim();
+const CARRIER_CODE = Number(process.env.TRACK17_CARRIER_CODE || 0) || undefined;
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://zona3brandon.us,https://www.zona3brandon.us')
-  .split(',').map(v => v.trim()).filter(Boolean);
+  .split(',').map(value => value.trim()).filter(Boolean);
 const DEBUG_TRACKING = process.env.DEBUG_TRACKING === '1';
 
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({
-  origin(origin, cb) {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(new Error('Origen no permitido'));
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origen no permitido'));
   },
   methods: ['GET'],
   maxAge: 86400
 }));
 app.use(rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false }));
 
-let browserPromise;
-function getBrowser() {
-  if (!browserPromise) {
-    browserPromise = chromium.launch({
-      headless: true,
-      args: [
-        '--disable-dev-shm-usage',
-        '--no-sandbox',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-features=IsolateOrigins,site-per-process'
-      ]
-    }).catch(err => { browserPromise = null; throw err; });
-  }
-  return browserPromise;
-}
+const STATUS_MAP = {
+  NotFound: ['Sin información', 'Pendiente de registro'],
+  InfoReceived: ['Información recibida', 'Recepción'],
+  InTransit: ['En tránsito', 'En camino'],
+  Expired: ['Envío demorado', 'En camino'],
+  AvailableForPickup: ['Disponible para recoger', 'En entrega'],
+  OutForDelivery: ['En reparto', 'En entrega'],
+  DeliveryFailure: ['Intento de entrega', 'En entrega'],
+  Delivered: ['Entregado', 'Entregado'],
+  Exception: ['Incidencia en el envío', 'En proceso']
+};
 
 function clean(value = '') {
-  return String(value)
-    .replace(/\u00a0/g, ' ')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n\s*\n+/g, '\n')
-    .trim();
+  return String(value).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-const statusPattern = /^(FACTURADO|CLASIFICADO|SALIDA(?: DE)? ADUANA|ENTREGADO A ADUANA|RECEPCIONADO|RECIBIDO|EN CAMINO|EN ENTREGA|ENTREGADO|DESPACHADO|ARRIBO|ADUANA|LLEGADA A LA OCI|IMPOSICI[ÓO]N|INTENTO ENTREGA|EN TR[ÁA]NSITO|DEVUELTO)$/i;
-const datePattern = /(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre|january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},\s+\d{4}(?:\s+\d{1,2}:\d{2}\s*(?:AM|PM)?)?|\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?/i;
-const resultMarkers = /PA[IÍ]S ORIGEN|FACTURADO|CLASIFICADO|RECEPCIONADO|ENTREGADO A ADUANA|SALIDA(?: DE)? ADUANA|LLEGADA A LA OCI|IMPOSICI[ÓO]N|INTENTO ENTREGA/i;
-const emptyMarkers = /NO (?:SE )?(?:ENCUENTRA|EXISTE)|SIN INFORMACI[ÓO]N|NO HAY INFORMACI[ÓO]N|NO SE ENCONTRARON RESULTADOS|NO EST[ÁA] REGISTRADO/i;
+function createApiError(message, technicalCode, details = null, status = 502) {
+  const error = new Error(message);
+  error.technicalCode = technicalCode;
+  error.details = details;
+  error.status = status;
+  return error;
+}
 
-function parseText(raw) {
-  const text = clean(raw);
-  const lines = text.split('\n').map(clean).filter(Boolean);
-  const events = [];
+async function post17Track(endpoint, body, timeoutMs = 35_000) {
+  if (!API_KEY) {
+    throw createApiError(
+      'La clave de 17TRACK no está configurada en Render.',
+      'TRACK17_KEY_MISSING',
+      null,
+      503
+    );
+  }
 
-  for (let i = 0; i < lines.length; i++) {
-    const lineWithoutDate = clean(lines[i].replace(datePattern, ''));
-    if (!statusPattern.test(lineWithoutDate)) continue;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${API_BASE}/${endpoint}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        '17token': API_KEY,
+        'user-agent': 'Zona3B-Tracking/10.0'
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
 
-    const nearby = lines.slice(Math.max(0, i - 2), Math.min(lines.length, i + 6));
-    const joined = nearby.join(' · ');
-    const date = (joined.match(datePattern) || [])[0] || '';
-    const locationParts = nearby.filter(v => /^(En:|Hacia:|Peso:)/i.test(v));
-    const location = locationParts.join(' · ');
-    const status = lineWithoutDate.toUpperCase();
-
-    if (!events.some(e => e.status === status && e.date === date && e.location === location)) {
-      events.push({ status, date, location });
+    const raw = await response.text();
+    let payload;
+    try {
+      payload = raw ? JSON.parse(raw) : {};
+    } catch {
+      throw createApiError('17TRACK devolvió una respuesta no válida.', 'TRACK17_INVALID_RESPONSE', {
+        httpStatus: response.status,
+        preview: raw.slice(0, 500)
+      });
     }
-  }
 
-  let stage = 'En proceso';
-  let status = 'Información localizada';
-  if (/\bENTREGADO\b/i.test(text) && !/ENTREGADO A ADUANA/i.test(text)) {
-    stage = 'Entregado'; status = 'Envío entregado';
-  } else if (/INTENTO ENTREGA|EN ENTREGA/i.test(text)) {
-    stage = 'En entrega'; status = 'En proceso de entrega';
-  } else if (/EN CAMINO|FACTURADO|DESPACHADO|SALIDA(?: DE)? ADUANA|EN TR[ÁA]NSITO/i.test(text)) {
-    stage = 'En camino'; status = 'Envío en camino';
-  } else if (/RECEPCIONADO|RECIBIDO|CLASIFICADO|ENTREGADO A ADUANA/i.test(text)) {
-    stage = 'Recepción'; status = 'Envío recibido';
+    if (!response.ok || Number(payload?.code ?? 0) !== 0) {
+      throw createApiError('17TRACK rechazó la consulta.', 'TRACK17_API_ERROR', {
+        httpStatus: response.status,
+        response: payload
+      }, response.status === 401 || response.status === 403 ? 503 : 502);
+    }
+    return payload;
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw createApiError('17TRACK tardó demasiado en responder.', 'TRACK17_TIMEOUT');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
+}
 
-  const country = (text.match(/Pa[ií]s Origen:\s*([^\n]+)/i) || [])[1];
+function rejectedError(payload) {
+  const rejected = payload?.data?.rejected;
+  if (!Array.isArray(rejected) || rejected.length === 0) return null;
+  const first = rejected[0];
   return {
-    ok: events.length > 0,
-    status,
-    stage,
-    summary: country ? `País de origen: ${clean(country)}` : 'Movimientos informados por el operador postal.',
-    events: events.slice(0, 30)
+    code: Number(first?.error?.code || 0),
+    message: clean(first?.error?.message || 'La consulta fue rechazada.'),
+    carrier: first?.carrier || 0
   };
 }
 
-async function firstVisible(locator) {
-  const count = await locator.count();
-  for (let i = 0; i < count; i++) {
-    const item = locator.nth(i);
-    if (await item.isVisible().catch(() => false)) return item;
-  }
-  return null;
+function acceptedItem(payload) {
+  const accepted = payload?.data?.accepted;
+  return Array.isArray(accepted) && accepted.length ? accepted[0] : null;
 }
 
-async function locateForm(page) {
-  const codeInput = await firstVisible(page.locator([
-    'input[placeholder*="código" i]',
-    'input[placeholder*="codigo" i]',
-    'input[placeholder*="seguimiento" i]',
-    'input[name*="codigo" i]',
-    'input[id*="codigo" i]',
-    'input[name*="tracking" i]'
-  ].join(',')));
-
-  const yearInput = await firstVisible(page.locator([
-    'input[placeholder*="año" i]',
-    'input[placeholder*="ano" i]',
-    'input[name*="anno" i]',
-    'input[name*="anio" i]',
-    'input[name*="year" i]',
-    'input[id*="anno" i]',
-    'input[id*="anio" i]'
-  ].join(',')));
-
-  if (codeInput && yearInput) return { codeInput, yearInput };
-
-  // Fallback: ubica el bloque que contiene el título del rastreador y usa sus campos visibles.
-  const heading = page.getByText(/RASTREADOR DE ENV[IÍ]OS/i).first();
-  if (await heading.count()) {
-    const block = heading.locator('xpath=ancestor::*[self::form or self::section or self::div][.//input][1]');
-    if (await block.count()) {
-      const visible = block.locator('input:visible');
-      const count = await visible.count();
-      if (count >= 2) return { codeInput: visible.nth(count - 2), yearInput: visible.nth(count - 1) };
-    }
-  }
-
-  const visibleInputs = page.locator('input:visible');
-  const count = await visibleInputs.count();
-  for (let i = 0; i < count - 1; i++) {
-    const a = visibleInputs.nth(i);
-    const b = visibleInputs.nth(i + 1);
-    const ap = clean(await a.getAttribute('placeholder') || '');
-    const bp = clean(await b.getAttribute('placeholder') || '');
-    if (/c[oó]digo|seguimiento/i.test(ap) && /año|ano/i.test(bp)) return { codeInput: a, yearInput: b };
-  }
-
-  return { codeInput: null, yearInput: null };
+function eventTimestamp(event) {
+  const candidate = event?.time_utc || event?.time_iso ||
+    [event?.time_raw?.date, event?.time_raw?.time].filter(Boolean).join('T');
+  const timestamp = Date.parse(candidate || '');
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
-async function findSearchButton(page, codeInput) {
-  // Primero busca dentro del mismo formulario/contenedor que el campo de código.
-  const form = codeInput.locator('xpath=ancestor::form[1]');
-  if (await form.count()) {
-    const btn = await firstVisible(form.locator('button, input[type="submit"], input[type="button"]'));
-    if (btn) return btn;
-  }
+function formatEvent(event, providerName = '') {
+  const translated = event?.description_translation?.description;
+  const description = clean(translated || event?.description || event?.stage || 'Movimiento del envío');
+  const address = event?.address || {};
+  const addressParts = [
+    event?.location,
+    address?.street,
+    address?.city,
+    address?.state,
+    address?.country,
+    address?.postal_code
+  ].map(clean).filter(Boolean);
 
-  const parentBlock = codeInput.locator('xpath=ancestor::*[self::section or self::div][.//*[self::button or @type="submit" or @type="button"]][1]');
-  if (await parentBlock.count()) {
-    const btn = await firstVisible(parentBlock.locator('button:has-text("Buscar"), input[value*="Buscar" i], button[type="submit"], input[type="submit"]'));
-    if (btn) return btn;
-  }
-
-  return firstVisible(page.locator('button:has-text("Buscar"), input[value*="Buscar" i], button[type="submit"], input[type="submit"]'));
+  return {
+    status: description,
+    date: event?.time_iso || event?.time_utc || clean([
+      event?.time_raw?.date,
+      event?.time_raw?.time
+    ].filter(Boolean).join(' ')),
+    location: [...new Set(addressParts)].join(' · '),
+    provider: clean(providerName),
+    stage: clean(event?.stage || ''),
+    subStatus: clean(event?.sub_status || '')
+  };
 }
 
-async function waitForResult(page, capturedBodies, timeoutMs = 45_000) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const bodyText = await page.locator('body').innerText().catch(() => '');
-    if (resultMarkers.test(bodyText) || emptyMarkers.test(bodyText)) return bodyText;
+function normalizeTrack(item, code) {
+  const info = item?.track_info || {};
+  const latestStatus = info?.latest_status || {};
+  const statusKey = clean(latestStatus?.status || 'NotFound');
+  const [status, stage] = STATUS_MAP[statusKey] || [statusKey || 'En proceso', 'En proceso'];
 
-    for (let i = capturedBodies.length - 1; i >= 0; i--) {
-      const candidate = capturedBodies[i]?.body || '';
-      if (resultMarkers.test(candidate) || emptyMarkers.test(candidate)) return candidate;
+  const providers = Array.isArray(info?.tracking?.providers) ? info.tracking.providers : [];
+  const events = [];
+  for (const providerEntry of providers) {
+    const providerName = providerEntry?.provider?.name || providerEntry?.provider?.alias || '';
+    const providerEvents = Array.isArray(providerEntry?.events) ? providerEntry.events : [];
+    for (const event of providerEvents) {
+      events.push({ ...formatEvent(event, providerName), _ts: eventTimestamp(event) });
     }
-    await page.waitForTimeout(750);
   }
-  return '';
+
+  if (events.length === 0 && info?.latest_event) {
+    events.push({ ...formatEvent(info.latest_event, providers[0]?.provider?.name || ''), _ts: eventTimestamp(info.latest_event) });
+  }
+
+  events.sort((a, b) => b._ts - a._ts);
+  const uniqueEvents = [];
+  const seen = new Set();
+  for (const event of events) {
+    const key = `${event.status}|${event.date}|${event.location}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const { _ts, ...publicEvent } = event;
+    uniqueEvents.push(publicEvent);
+  }
+
+  const origin = info?.shipping_info?.shipper_address || {};
+  const destination = info?.shipping_info?.recipient_address || {};
+  const carrier = providers[0]?.provider || {};
+  const estimated = info?.time_metrics?.estimated_delivery_date || {};
+  const latestDescription = clean(
+    info?.latest_event?.description_translation?.description ||
+    info?.latest_event?.description ||
+    latestStatus?.sub_status_descr || ''
+  );
+
+  const summaryParts = [];
+  if (carrier?.name) summaryParts.push(`Transportista: ${clean(carrier.name)}`);
+  if (origin?.country) summaryParts.push(`Origen: ${clean(origin.country)}`);
+  if (destination?.country) summaryParts.push(`Destino: ${clean(destination.country)}`);
+  if (latestDescription) summaryParts.push(latestDescription);
+
+  return {
+    ok: true,
+    trackingNumber: code,
+    carrier: {
+      code: item?.carrier || carrier?.key || null,
+      name: clean(carrier?.name || carrier?.alias || 'Operador postal')
+    },
+    status,
+    stage,
+    mainStatus: statusKey,
+    subStatus: clean(latestStatus?.sub_status || ''),
+    summary: summaryParts.join(' · ') || 'Información suministrada por 17TRACK.',
+    estimatedDelivery: {
+      from: estimated?.from || null,
+      to: estimated?.to || null,
+      source: estimated?.source || null
+    },
+    events: uniqueEvents.slice(0, 50)
+  };
 }
 
-async function performAttempt(code, year, attempt) {
-  const browser = await getBrowser();
-  const context = await browser.newContext({
-    locale: 'es-ES',
-    timezoneId: 'America/Havana',
-    viewport: { width: 1440, height: 1100 },
-    extraHTTPHeaders: {
-      'Accept-Language': 'es-ES,es;q=0.9,en;q=0.7',
-      'Cache-Control': 'no-cache',
-      Pragma: 'no-cache'
+function requestItem(code, year, includeCacheLevel = false) {
+  const item = {
+    number: code,
+    origin_country: 'US',
+    destination_country: 'CU'
+  };
+  if (CARRIER_CODE) item.carrier = CARRIER_CODE;
+  if (includeCacheLevel) item.cacheLevel = 0;
+  // El año se conserva para compatibilidad con la interfaz de Zona 3B.
+  // 17TRACK no acepta un año aislado como parámetro de consulta.
+  void year;
+  return item;
+}
+
+async function getTracking(code, year) {
+  // Primero consulta datos ya registrados. Esta operación no inicia una nueva consulta al transportista.
+  const stored = await post17Track('gettrackinfo', [requestItem(code, year)]);
+  const storedItem = acceptedItem(stored);
+  const storedRejected = rejectedError(stored);
+
+  if (storedItem) {
+    const normalized = normalizeTrack(storedItem, code);
+    if (normalized.events.length > 0 && normalized.mainStatus !== 'NotFound') return normalized;
+  }
+
+  // Si no existe o no tiene movimientos, realiza una consulta estándar en tiempo real.
+  const realtime = await post17Track('getRealTimeTrackInfo', [requestItem(code, year, true)], 40_000);
+  const realtimeItem = acceptedItem(realtime);
+  const realtimeRejected = rejectedError(realtime);
+
+  if (realtimeItem) return normalizeTrack(realtimeItem, code);
+
+  const rejection = realtimeRejected || storedRejected;
+  if (rejection) {
+    if (rejection.code === -18019903) {
+      throw createApiError(
+        '17TRACK no pudo identificar automáticamente el operador de este número.',
+        'CARRIER_NOT_DETECTED',
+        rejection,
+        422
+      );
     }
-  });
-
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-  });
-
-  const page = await context.newPage();
-  page.setDefaultTimeout(20_000);
-  const capturedBodies = [];
-  const networkLog = [];
-
-  page.on('response', async response => {
-    const req = response.request();
-    const type = req.resourceType();
-    const ct = response.headers()['content-type'] || '';
-    if (['xhr', 'fetch', 'document'].includes(type)) {
-      networkLog.push({ method: req.method(), status: response.status(), type, url: response.url().slice(0, 300) });
-      if (/text|html|json|javascript/i.test(ct)) {
-        try {
-          const body = await response.text();
-          if (body && body.length < 2_000_000) capturedBodies.push({ url: response.url(), body });
-        } catch {}
-      }
+    if (rejection.code === -18019908) {
+      throw createApiError('La cuota disponible de 17TRACK se agotó.', 'TRACK17_QUOTA_EXHAUSTED', rejection, 429);
     }
-  });
-
-  // Evita descargar recursos pesados; no bloquea scripts, XHR ni hojas de estilo.
-  await page.route('**/*', route => {
-    const type = route.request().resourceType();
-    if (['image', 'media', 'font'].includes(type)) return route.abort();
-    return route.continue();
-  });
-
-  try {
-    const target = `${TRACKING_URL}${TRACKING_URL.includes('?') ? '&' : '?'}zona3b=${Date.now()}-${attempt}`;
-    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-    await page.waitForLoadState('networkidle', { timeout: 12_000 }).catch(() => {});
-
-    const { codeInput, yearInput } = await locateForm(page);
-    if (!codeInput || !yearInput) {
-      const inputs = await page.locator('input:visible').evaluateAll(nodes => nodes.map(n => ({
-        name: n.getAttribute('name'), id: n.id, placeholder: n.getAttribute('placeholder'), type: n.getAttribute('type')
-      })));
-      throw Object.assign(new Error('No se localizaron los campos del rastreador oficial.'), { diagnostics: { inputs, networkLog } });
-    }
-
-    await codeInput.scrollIntoViewIfNeeded();
-    await codeInput.click({ clickCount: 3 });
-    await codeInput.fill(code);
-    await yearInput.click({ clickCount: 3 });
-    await yearInput.fill(String(year));
-
-    const button = await findSearchButton(page, codeInput);
-    if (!button) throw Object.assign(new Error('No se encontró el botón Buscar.'), { diagnostics: { networkLog } });
-
-    await Promise.all([
-      button.click({ force: true }),
-      page.waitForTimeout(500)
-    ]);
-
-    // Algunos formularios solo reaccionan bien al Enter.
-    await page.keyboard.press('Enter').catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
-
-    const resultText = await waitForResult(page, capturedBodies, 45_000);
-    if (!resultText) {
-      const bodyText = await page.locator('body').innerText().catch(() => '');
-      throw Object.assign(new Error('El rastreador no produjo una respuesta reconocible.'), {
-        diagnostics: {
-          pageUrl: page.url(),
-          bodyPreview: clean(bodyText).slice(0, 2500),
-          networkLog: networkLog.slice(-30),
-          capturedUrls: capturedBodies.map(x => x.url).slice(-20)
-        }
-      });
-    }
-
-    if (emptyMarkers.test(resultText) && !resultMarkers.test(resultText)) {
+    if (rejection.code === -18019909) {
       return {
         ok: true,
-        status: 'Sin información disponible',
+        trackingNumber: code,
+        status: 'Sin información',
         stage: 'Pendiente de registro',
-        summary: 'El operador postal todavía no muestra movimientos para este código.',
+        mainStatus: 'NotFound',
+        subStatus: '',
+        summary: '17TRACK todavía no muestra movimientos para este número.',
+        carrier: { code: rejection.carrier || null, name: 'Operador postal' },
+        estimatedDelivery: { from: null, to: null, source: null },
         events: []
       };
     }
-
-    const result = parseText(resultText);
-    if (!result.ok) {
-      throw Object.assign(new Error('Se recibió información, pero no se pudieron interpretar los movimientos.'), {
-        diagnostics: { resultPreview: clean(resultText).slice(0, 3000), networkLog: networkLog.slice(-30) }
-      });
-    }
-    return result;
-  } finally {
-    await context.close();
+    throw createApiError(rejection.message, 'TRACK17_REJECTED', rejection, 422);
   }
+
+  throw createApiError('17TRACK no devolvió información para este número.', 'TRACK17_EMPTY_RESPONSE');
 }
 
-async function track(code, year) {
-  let lastError;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      return await performAttempt(code, year, attempt);
-    } catch (error) {
-      lastError = error;
-      console.error(JSON.stringify({
-        time: new Date().toISOString(), code, year, attempt,
-        error: error?.message,
-        diagnostics: error?.diagnostics || null
-      }));
-      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 1500));
-    }
-  }
-  throw lastError;
-}
+app.get('/health', (_req, res) => {
+  res.set('Cache-Control', 'no-store').json({
+    ok: true,
+    service: 'zona3b-rastreo',
+    version: '10.0.0',
+    provider: '17TRACK',
+    apiConfigured: Boolean(API_KEY)
+  });
+});
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'zona3b-rastreo', version: '9.0.0' }));
-
-app.get('/api/track', async (req, res) => {
-  const code = String(req.query.codigo || '').trim().toUpperCase();
-  const year = String(req.query.anio || new Date().getFullYear()).trim();
-  if (!/^[A-Z0-9-]{6,40}$/.test(code)) return res.status(400).json({ ok: false, message: 'Número de rastreo inválido.' });
-  if (!/^20\d{2}$/.test(year)) return res.status(400).json({ ok: false, message: 'Año inválido.' });
-
+app.get('/api/quota', async (_req, res) => {
   try {
-    const result = await track(code, year);
-    return res.set('Cache-Control', 'no-store').json({ ...result, source: 'Correos de Cuba', checkedAt: new Date().toISOString() });
+    const quota = await post17Track('getquota', []);
+    res.set('Cache-Control', 'no-store').json({ ok: true, data: quota.data || quota });
   } catch (error) {
-    return res.status(502).set('Cache-Control', 'no-store').json({
+    res.status(error?.status || 502).json({
       ok: false,
-      message: 'No fue posible obtener el rastreo en este momento. Intenta nuevamente en unos minutos.',
-      technicalCode: 'UPSTREAM_TRACKING_ERROR',
-      ...(DEBUG_TRACKING ? { debug: { message: error?.message, diagnostics: error?.diagnostics || null } } : {})
+      message: error?.message || 'No fue posible consultar la cuota.',
+      technicalCode: error?.technicalCode || 'TRACK17_QUOTA_ERROR'
     });
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`Zona 3B tracking server v9.0 listening on ${PORT}`));
+app.get('/api/track', async (req, res) => {
+  const code = String(req.query.codigo || '').trim().toUpperCase();
+  const year = String(req.query.anio || new Date().getFullYear()).trim();
 
-process.on('SIGTERM', async () => {
-  if (browserPromise) {
-    try { const browser = await browserPromise; await browser.close(); } catch {}
+  if (!/^[A-Z0-9-]{6,40}$/.test(code)) {
+    return res.status(400).json({ ok: false, message: 'Número de rastreo inválido.', technicalCode: 'INVALID_TRACKING_NUMBER' });
   }
-  process.exit(0);
+  if (!/^20\d{2}$/.test(year)) {
+    return res.status(400).json({ ok: false, message: 'Año inválido.', technicalCode: 'INVALID_YEAR' });
+  }
+
+  try {
+    const result = await getTracking(code, year);
+    return res.set('Cache-Control', 'no-store').json({
+      ...result,
+      source: '17TRACK',
+      checkedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error(JSON.stringify({
+      time: new Date().toISOString(),
+      code,
+      year,
+      technicalCode: error?.technicalCode,
+      message: error?.message,
+      details: error?.details || null
+    }));
+
+    return res.status(error?.status || 502).set('Cache-Control', 'no-store').json({
+      ok: false,
+      message: error?.message || 'No fue posible obtener el rastreo en este momento.',
+      technicalCode: error?.technicalCode || 'TRACK17_UPSTREAM_ERROR',
+      ...(DEBUG_TRACKING ? { debug: error?.details || null } : {})
+    });
+  }
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Zona 3B tracking server v10.0 listening on ${PORT}; 17TRACK configured=${Boolean(API_KEY)}`);
 });

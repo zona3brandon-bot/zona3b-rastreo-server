@@ -1,23 +1,31 @@
-# Zona 3B Tracking Server v9.0
+# Zona 3B Tracking Server v10.0
 
-Servidor Node.js + Playwright para consultar el rastreador público de Correos de Cuba.
+Backend Node.js para consultar la API oficial de 17TRACK y entregar los movimientos a `zona3brandon.us`.
 
-## Actualización
+## Variable obligatoria en Render
 
-Esta versión mejora la localización del formulario, captura respuestas XHR/fetch, reintenta la consulta y registra diagnósticos detallados en los Logs de Render.
+- `TRACK17_API_KEY`: clave de seguridad completa de 17TRACK.
 
-## Archivos que se reemplazan en GitHub
+No publiques esta clave en GitHub ni dentro de la página web.
 
-- `src/server.js`
-- `package.json`
+## Variable opcional
 
-También puede subirse todo el contenido de esta carpeta reemplazando el repositorio actual.
+- `TRACK17_CARRIER_CODE`: código numérico del operador en 17TRACK. Déjala sin configurar para permitir detección automática.
+- `ALLOWED_ORIGINS`: por defecto `https://zona3brandon.us,https://www.zona3brandon.us`.
+- `DEBUG_TRACKING=1`: agrega detalles técnicos a los errores. Úsala solo temporalmente.
 
-## Pruebas
+## Endpoints
 
 - `GET /health`
+- `GET /api/quota`
 - `GET /api/track?codigo=CM872184101ZB&anio=2026`
 
-## Diagnóstico temporal
+## Verificación
 
-Si aún falla, agregue en Render la variable `DEBUG_TRACKING=1`, despliegue de nuevo y abra el endpoint de prueba. La respuesta incluirá datos técnicos para identificar cambios del sitio externo. Después elimine o cambie la variable a `0`.
+1. Sube todos los archivos a la raíz de `zona3b-rastreo-server`.
+2. Render desplegará el nuevo commit automáticamente.
+3. Abre `/health` y confirma `"version":"10.0.0"` y `"apiConfigured":true`.
+4. Abre `/api/quota` para verificar la clave y la cuota.
+5. Prueba `/api/track`.
+
+La primera consulta puede devolver `Sin información` si 17TRACK todavía no recibe movimientos del operador. El servidor utiliza primero `/gettrackinfo` y después `/getRealTimeTrackInfo` en modo estándar.
