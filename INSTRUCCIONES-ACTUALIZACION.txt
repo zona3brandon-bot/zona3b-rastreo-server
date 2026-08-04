@@ -1,0 +1,20 @@
+ACTUALIZACIÓN DEL SERVIDOR DE RASTREO V9.0
+
+1. Descomprime el ZIP.
+2. En GitHub abre el repositorio zona3b-rastreo-server.
+3. Pulsa Add file > Upload files.
+4. Sube TODO el contenido de la carpeta descomprimida y reemplaza los archivos existentes.
+5. Confirma el commit con el mensaje: Actualizar rastreo v9.0.
+6. Render detectará el commit y desplegará automáticamente.
+7. Espera a que el estado indique Live.
+8. Prueba:
+   https://zona3b-rastreo-server.onrender.com/health
+   Debe indicar version 9.0.0.
+9. Prueba:
+   https://zona3b-rastreo-server.onrender.com/api/track?codigo=CM872184101ZB&anio=2026
+
+Si aún devuelve UPSTREAM_TRACKING_ERROR:
+- En Render entra en Environment.
+- Agrega DEBUG_TRACKING con valor 1.
+- Guarda y vuelve a desplegar.
+- Abre otra vez el endpoint y envía una captura de la respuesta JSON y de Logs.
