@@ -1,23 +1,20 @@
-# Zona 3B Tracking Server v10.2
+# Zona 3B Tracking Server v10.3
 
-Backend Node.js para la API oficial de 17TRACK.
+Backend para la página de seguimiento de Zona 3B Brandon usando la API oficial de 17TRACK.
 
-## Corrección principal
+## Corrección crítica
 
-- Fuerza el transportista **Correos de Cuba (código 3211)**.
-- Intenta consulta en tiempo real.
-- Si no está disponible, registra la guía y consulta los datos almacenados.
-- Devuelve el error real de 17TRACK en el campo `upstream` para facilitar diagnósticos.
+- **Correos de Cuba:** carrier `3201`
+- **Cyprus Post:** carrier `3211`
 
-## Variable requerida en Render
+Esta versión corrige automáticamente registros antiguos creados con Cyprus Post mediante el endpoint oficial `changecarrier`, y después consulta siempre con Correos de Cuba.
+
+## Variable requerida
 
 `TRACK17_API_KEY`
 
-Opcional: `TRACK17_CARRIER_CODE=3211`
+## Endpoints
 
-
-## Corrección v10.2
-
-- Fuerza siempre Correos de Cuba (`carrier: 3211`, `auto_detection: false`).
-- Detecta y elimina inscripciones duplicadas del mismo número con transportistas incorrectos.
-- Conserva únicamente la inscripción oficial de Correos de Cuba.
+- `GET /health`
+- `GET /api/quota`
+- `GET /api/track?codigo=CM872184101ZB&anio=2026`

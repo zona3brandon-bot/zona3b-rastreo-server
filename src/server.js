@@ -6,7 +6,9 @@ import rateLimit from 'express-rate-limit';
 const PORT = Number(process.env.PORT || 10000);
 const API_BASE = 'https://api.17track.net/track/v2.4';
 const API_KEY = String(process.env.TRACK17_API_KEY || '').trim();
-const CARRIER_CODE = Number(process.env.TRACK17_CARRIER_CODE || 3211); // Correos de Cuba
+const CARRIER_CODE = Number(process.env.TRACK17_CARRIER_CODE || 3201); // Correos de Cuba
+const WRONG_CARRIER_CODES = (process.env.TRACK17_WRONG_CARRIER_CODES || '3211')
+  .split(',').map(value => Number(value.trim())).filter(value => Number.isFinite(value) && value > 0 && value !== CARRIER_CODE);
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://zona3brandon.us,https://www.zona3brandon.us')
   .split(',').map(value => value.trim()).filter(Boolean);
 const DEBUG_TRACKING = process.env.DEBUG_TRACKING === '1';
@@ -66,7 +68,7 @@ async function post17Track(endpoint, body, timeoutMs = 35_000) {
       headers: {
         'content-type': 'application/json',
         '17token': API_KEY,
-        'user-agent': 'Zona3B-Tracking/10.2'
+        'user-agent': 'Zona3B-Tracking/10.3'
       },
       body: JSON.stringify(body),
       signal: controller.signal
@@ -223,7 +225,6 @@ function requestItem(code, year, includeCacheLevel = false) {
     origin_country: 'US',
     destination_country: 'CU',
     carrier: CARRIER_CODE,
-    auto_detection: false,
     lang: 'es',
     tag: 'ZONA3B-CUBA'
   };
@@ -250,49 +251,53 @@ function isAlreadyRegistered(rejection) {
 
 
 
-async function removeWrongCarrierRegistrations(code) {
-  // Un número UPU puede coincidir con varios operadores. Versiones anteriores
-  // permitieron que 17TRACK lo registrara también como Cyprus Post. Consultamos
-  // todas las inscripciones del número y eliminamos únicamente las que no sean
-  // Correos de Cuba (3211).
-  try {
-    const lookup = await post17Track('gettrackinfo', [{ number: code }], 25_000);
-    const accepted = Array.isArray(lookup?.data?.accepted) ? lookup.data.accepted : [];
-    const wrong = accepted
-      .map(item => Number(item?.carrier || item?.track_info?.tracking?.providers?.[0]?.provider?.key || 0))
-      .filter(carrier => carrier && carrier !== CARRIER_CODE);
+async function repairWrongCarrierRegistration(code) {
+  // En la lista oficial de 17TRACK, Correos de Cuba es 3201.
+  // Versiones anteriores registraron por error el código 3211 (Cyprus Post).
+  // La API permite reasignar el transportista indicando carrier_old y carrier_new.
+  const results = [];
 
-    if (wrong.length === 0) return [];
+  for (const oldCarrier of WRONG_CARRIER_CODES) {
+    try {
+      const changed = await post17Track('changecarrier', [{ 
+        number: code,
+        carrier_old: oldCarrier,
+        carrier_new: CARRIER_CODE
+      }], 25_000);
 
-    const uniqueWrong = [...new Set(wrong)];
-    const deletion = await post17Track(
-      'deletetrack',
-      uniqueWrong.map(carrier => ({ number: code, carrier })),
-      25_000
-    );
+      const accepted = Array.isArray(changed?.data?.accepted) ? changed.data.accepted : [];
+      const rejected = rejectedError(changed);
 
-    const deleted = Array.isArray(deletion?.data?.accepted)
-      ? deletion.data.accepted.map(item => Number(item?.carrier || 0)).filter(Boolean)
-      : [];
-
-    if (deleted.length) {
-      console.log(JSON.stringify({ action: 'removed-wrong-carriers', code, deleted }));
+      if (accepted.length > 0) {
+        results.push({ oldCarrier, changed: true });
+        console.log(JSON.stringify({
+          action: 'carrier-corrected',
+          code,
+          carrierOld: oldCarrier,
+          carrierNew: CARRIER_CODE
+        }));
+      } else if (rejected) {
+        // Si no existe un registro con ese transportista, no es un error fatal.
+        results.push({ oldCarrier, changed: false, rejection: rejected });
+      }
+    } catch (error) {
+      // La reparación no debe impedir una consulta directa con Correos de Cuba.
+      console.warn(JSON.stringify({
+        action: 'carrier-correction-skipped',
+        code,
+        carrierOld: oldCarrier,
+        carrierNew: CARRIER_CODE,
+        technicalCode: error?.technicalCode || null,
+        message: error?.message || String(error)
+      }));
     }
-    return deleted;
-  } catch (error) {
-    // La limpieza no debe impedir que el cliente vea el rastreo correcto.
-    console.warn(JSON.stringify({
-      action: 'carrier-cleanup-skipped',
-      code,
-      technicalCode: error?.technicalCode || null,
-      message: error?.message || String(error)
-    }));
-    return [];
   }
+
+  return results;
 }
 
 async function getTracking(code, year) {
-  await removeWrongCarrierRegistrations(code);
+  await repairWrongCarrierRegistration(code);
   const queryItem = requestItem(code, year, true);
 
   // Correos de Cuba debe consultarse con el código de transportista 3211.
@@ -362,7 +367,7 @@ app.get('/health', (_req, res) => {
   res.set('Cache-Control', 'no-store').json({
     ok: true,
     service: 'zona3b-rastreo',
-    version: '10.2.0',
+    version: '10.3.0',
     provider: '17TRACK',
     apiConfigured: Boolean(API_KEY)
   });
@@ -420,5 +425,5 @@ app.get('/api/track', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Zona 3B tracking server v10.2 listening on ${PORT}; 17TRACK configured=${Boolean(API_KEY)}`);
+  console.log(`Zona 3B tracking server v10.3 listening on ${PORT}; 17TRACK configured=${Boolean(API_KEY)}`);
 });

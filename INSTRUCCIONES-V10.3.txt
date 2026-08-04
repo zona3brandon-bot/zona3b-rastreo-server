@@ -1,0 +1,22 @@
+ZONA 3B - SERVIDOR DE RASTREO V10.3
+
+CORRECCION PRINCIPAL
+- Correos de Cuba en 17TRACK usa el código 3201.
+- Cyprus Post usa el código 3211.
+- Versiones anteriores tenían estos códigos invertidos.
+
+QUE HACE ESTA VERSION
+1. Antes de consultar, intenta cambiar automáticamente cualquier registro existente de Cyprus Post (3211) a Correos de Cuba (3201) usando /changecarrier.
+2. Registra y consulta siempre con carrier 3201.
+3. No usa detección automática.
+4. Mantiene la API Key en la variable TRACK17_API_KEY.
+
+INSTALACION
+1. Suba todos estos archivos al repositorio zona3b-rastreo-server y reemplace los anteriores.
+2. Commit sugerido: ACTUALIZACION V10.3 CODIGO CORREOS DE CUBA 3201
+3. Espere a que Render muestre Live.
+4. Abra /health y confirme version 10.3.0.
+5. Vuelva a consultar el paquete.
+
+NOTA
+El panel de 17TRACK puede tardar unos minutos en reflejar el cambio de transportista.
